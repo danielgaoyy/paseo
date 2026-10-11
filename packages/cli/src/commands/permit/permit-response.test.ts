@@ -1,3 +1,4 @@
+import { setImmediate as waitForCommandContinuations } from "node:timers/promises";
 import { Command } from "commander";
 import type {
   AgentPermissionRequest,
@@ -9,7 +10,12 @@ import { createDenyCommand } from "./deny.js";
 
 const agentId = "2d85f428-fdaf-4d98-906f-c583de2b805f";
 const requests: AgentPermissionRequest[] = [
-  { id: "permission-write", provider: "codex", name: "CodexBash", kind: "tool" },
+  {
+    id: "permission-write",
+    provider: "codex",
+    name: "CodexBash",
+    kind: "tool",
+  },
   { id: "permission-edit", provider: "codex", name: "CodexBash", kind: "tool" },
 ];
 
@@ -33,7 +39,7 @@ class PermissionClient implements PermitClient {
   async respondToPermission(
     _agentId: string,
     requestId: string,
-    response: AgentPermissionResponse,
+    response: AgentPermissionResponse
   ) {
     this.responses.set(requestId, response);
     this.notifyReceived();
@@ -42,7 +48,7 @@ class PermissionClient implements PermitClient {
   async respondToPermissionAndWait(
     responseAgentId: string,
     requestId: string,
-    response: AgentPermissionResponse,
+    response: AgentPermissionResponse
   ): Promise<void> {
     const confirmation = new Promise<void>((resolve, reject) => {
       this.confirmations.set(requestId, { resolve, reject });
@@ -68,7 +74,7 @@ class PermissionClient implements PermitClient {
     if (!confirmation) throw new Error(`No confirmation waiter: ${requestId}`);
     this.pending.splice(
       this.pending.findIndex((request) => request.id === requestId),
-      1,
+      1
     );
     confirmation.resolve();
   }
@@ -80,7 +86,9 @@ class PermissionClient implements PermitClient {
   }
 }
 
-const options = { daemonTarget: { kind: "endpoint" as const, host: "test.invalid" } };
+const options = {
+  daemonTarget: { kind: "endpoint" as const, host: "test.invalid" },
+};
 const actions = [
   { name: "allow", create: createAllowCommand, result: "allowed" },
   { name: "deny", create: createDenyCommand, result: "denied" },
@@ -94,14 +102,14 @@ for (const action of actions) {
         agentId,
         requests[0].id,
         options,
-        new Command(),
+        new Command()
       );
       void command.then(
         () => (completed = true),
-        () => false,
+        () => false
       );
       await client.waitForResponses(1);
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await waitForCommandContinuations();
       expect(completed).toBe(false);
       expect(client.closed).toBe(false);
       expect(client.pending).toEqual(requests);
@@ -127,21 +135,24 @@ for (const action of actions) {
         agentId,
         undefined,
         { ...options, all: true },
-        new Command(),
+        new Command()
       );
       void command.then(
         () => (completed = true),
-        () => false,
+        () => false
       );
       await client.waitForResponses(2);
       client.confirm(requests[0].id);
       // Wait beyond the first reply's promise continuations while withholding the second.
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await waitForCommandContinuations();
       expect(completed).toBe(false);
       expect(client.closed).toBe(false);
       client.confirm(requests[1].id);
       const result = await command;
-      expect(result.data.map((item) => item.result)).toEqual([action.result, action.result]);
+      expect(result.data.map((item) => item.result)).toEqual([
+        action.result,
+        action.result,
+      ]);
       expect(client.closed).toBe(true);
       expect(client.pending).toEqual([]);
     });
@@ -152,15 +163,19 @@ for (const action of actions) {
         agentId,
         requests[0].id,
         options,
-        new Command(),
+        new Command()
       );
       const failure = expect(command).rejects.toMatchObject({
         code: "PERMISSION_RESPONSE_UNCONFIRMED",
         message: expect.stringContaining(requests[0].id),
-        details: 'Use "paseo permit ls" to check whether the request is still pending',
+        details:
+          'Use "paseo permit ls" to check whether the request is still pending',
       });
       await client.waitForResponses(1);
-      client.fail(requests[0].id, new Error("Timeout waiting for message (15000ms)"));
+      client.fail(
+        requests[0].id,
+        new Error("Timeout waiting for message (15000ms)")
+      );
       await failure;
       expect(client.closed).toBe(true);
       expect(client.pending).toEqual(requests);
