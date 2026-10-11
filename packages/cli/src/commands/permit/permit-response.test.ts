@@ -39,7 +39,7 @@ class PermissionClient implements PermitClient {
   async respondToPermission(
     _agentId: string,
     requestId: string,
-    response: AgentPermissionResponse
+    response: AgentPermissionResponse,
   ) {
     this.responses.set(requestId, response);
     this.notifyReceived();
@@ -48,7 +48,7 @@ class PermissionClient implements PermitClient {
   async respondToPermissionAndWait(
     responseAgentId: string,
     requestId: string,
-    response: AgentPermissionResponse
+    response: AgentPermissionResponse,
   ): Promise<void> {
     const confirmation = new Promise<void>((resolve, reject) => {
       this.confirmations.set(requestId, { resolve, reject });
@@ -74,7 +74,7 @@ class PermissionClient implements PermitClient {
     if (!confirmation) throw new Error(`No confirmation waiter: ${requestId}`);
     this.pending.splice(
       this.pending.findIndex((request) => request.id === requestId),
-      1
+      1,
     );
     confirmation.resolve();
   }
@@ -102,11 +102,11 @@ for (const action of actions) {
         agentId,
         requests[0].id,
         options,
-        new Command()
+        new Command(),
       );
       void command.then(
         () => (completed = true),
-        () => false
+        () => false,
       );
       await client.waitForResponses(1);
       await waitForCommandContinuations();
@@ -135,11 +135,11 @@ for (const action of actions) {
         agentId,
         undefined,
         { ...options, all: true },
-        new Command()
+        new Command(),
       );
       void command.then(
         () => (completed = true),
-        () => false
+        () => false,
       );
       await client.waitForResponses(2);
       client.confirm(requests[0].id);
@@ -149,10 +149,7 @@ for (const action of actions) {
       expect(client.closed).toBe(false);
       client.confirm(requests[1].id);
       const result = await command;
-      expect(result.data.map((item) => item.result)).toEqual([
-        action.result,
-        action.result,
-      ]);
+      expect(result.data.map((item) => item.result)).toEqual([action.result, action.result]);
       expect(client.closed).toBe(true);
       expect(client.pending).toEqual([]);
     });
@@ -163,19 +160,15 @@ for (const action of actions) {
         agentId,
         requests[0].id,
         options,
-        new Command()
+        new Command(),
       );
       const failure = expect(command).rejects.toMatchObject({
         code: "PERMISSION_RESPONSE_UNCONFIRMED",
         message: expect.stringContaining(requests[0].id),
-        details:
-          'Use "paseo permit ls" to check whether the request is still pending',
+        details: 'Use "paseo permit ls" to check whether the request is still pending',
       });
       await client.waitForResponses(1);
-      client.fail(
-        requests[0].id,
-        new Error("Timeout waiting for message (15000ms)")
-      );
+      client.fail(requests[0].id, new Error("Timeout waiting for message (15000ms)"));
       await failure;
       expect(client.closed).toBe(true);
       expect(client.pending).toEqual(requests);
