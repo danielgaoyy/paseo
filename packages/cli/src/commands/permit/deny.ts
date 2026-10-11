@@ -82,11 +82,21 @@ export async function runDenyCommand(
     // Deny permissions
     const results: PermissionResponseItem[] = await Promise.all(
       permissionsToDeny.map(async (permission) => {
-        await client.respondToPermission(resolvedAgentId, permission.id, {
-          behavior: "deny",
-          ...(options.message ? { message: options.message } : {}),
-          ...(options.interrupt ? { interrupt: true } : {}),
-        });
+        try {
+          await client.respondToPermissionAndWait(resolvedAgentId, permission.id, {
+            behavior: "deny",
+            ...(options.message ? { message: options.message } : {}),
+            ...(options.interrupt ? { interrupt: true } : {}),
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const error: CommandError = {
+            code: "PERMISSION_RESPONSE_UNCONFIRMED",
+            message: `Permission response unconfirmed for request ${permission.id}: ${message}`,
+            details: 'Use "paseo permit ls" to check whether the request is still pending',
+          };
+          throw error;
+        }
         return toPermissionResponseItem(resolvedAgentId, permission, "denied");
       }),
     );

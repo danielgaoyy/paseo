@@ -129,10 +129,20 @@ export async function runAllowCommand(
     // Allow permissions
     const results: PermissionResponseItem[] = await Promise.all(
       permissionsToAllow.map(async (permission) => {
-        await client.respondToPermission(resolvedAgentId, permission.id, {
-          behavior: "allow",
-          ...(updatedInput ? { updatedInput } : {}),
-        });
+        try {
+          await client.respondToPermissionAndWait(resolvedAgentId, permission.id, {
+            behavior: "allow",
+            ...(updatedInput ? { updatedInput } : {}),
+          });
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          const error: CommandError = {
+            code: "PERMISSION_RESPONSE_UNCONFIRMED",
+            message: `Permission response unconfirmed for request ${permission.id}: ${message}`,
+            details: 'Use "paseo permit ls" to check whether the request is still pending',
+          };
+          throw error;
+        }
         return toPermissionResponseItem(resolvedAgentId, permission, "allowed");
       }),
     );
