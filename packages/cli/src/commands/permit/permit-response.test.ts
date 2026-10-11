@@ -36,7 +36,7 @@ async function createDaemonPeer() {
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Missing peer port");
-  const responses = new Map<string, () => void>();
+  const responses = new Map<string, { socket: WebSocket; respond: () => void }>();
   const received = new Set<string>();
   const pending = [...requests];
   let notifyReceived = () => {};
@@ -99,19 +99,22 @@ async function createDaemonPeer() {
       });
     }
     if (message.type === "agent_permission_response") {
-      responses.set(message.requestId, () => {
-        pending.splice(
-          pending.findIndex((request) => request.id === message.requestId),
-          1,
-        );
-        emit(socket, {
-          type: "agent_permission_resolved",
-          payload: {
-            agentId: message.agentId,
-            requestId: message.requestId,
-            resolution: message.response,
-          },
-        });
+      responses.set(message.requestId, {
+        socket,
+        respond: () => {
+          pending.splice(
+            pending.findIndex((request) => request.id === message.requestId),
+            1,
+          );
+          emit(socket, {
+            type: "agent_permission_resolved",
+            payload: {
+              agentId: message.agentId,
+              requestId: message.requestId,
+              resolution: message.response,
+            },
+          });
+        },
       });
       received.add(message.requestId);
       notifyReceived();
@@ -131,15 +134,35 @@ async function createDaemonPeer() {
     }
   }
   function resolvePermission(requestId: string) {
-    const respond = responses.get(requestId);
-    if (!respond) throw new Error(`Response not received: ${requestId}`);
-    respond();
+    const response = responses.get(requestId);
+    if (!response) throw new Error(`Response not received: ${requestId}`);
+    response.respond();
+  }
+  async function resolveAndWaitForClient(requestId: string) {
+    const response = responses.get(requestId);
+    if (!response) throw new Error(`Response not received: ${requestId}`);
+    const { socket } = response;
+    // A pong after this reply proves the client consumed the preceding frame.
+    // Early completion closes the socket instead, which the caller also checks.
+    const processed = new Promise<void>((resolve) => {
+      const finish = () => {
+        socket.off("pong", finish);
+        socket.off("close", finish);
+        resolve();
+      };
+      socket.once("pong", finish);
+      socket.once("close", finish);
+    });
+    response.respond();
+    socket.ping();
+    await processed;
   }
   return {
     options: { daemonTarget: { kind: "endpoint" as const, host: `127.0.0.1:${address.port}` } },
     pending,
     waitForResponses,
     resolve: resolvePermission,
+    resolveAndWaitForClient,
     isClosed: () => closed,
   };
 }
@@ -184,7 +207,7 @@ for (const action of actions) {
         () => false,
       );
       await peer.waitForResponses(2);
-      peer.resolve(requests[0].id);
+      await peer.resolveAndWaitForClient(requests[0].id);
       expect(completed).toBe(false);
       expect(peer.isClosed()).toBe(false);
       peer.resolve(requests[1].id);
