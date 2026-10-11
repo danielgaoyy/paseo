@@ -1,191 +1,111 @@
-import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { Command } from "commander";
-import type { AgentPermissionRequest } from "@getpaseo/protocol/agent-types";
-import { SessionInboundMessageSchema } from "@getpaseo/protocol/messages";
-import { afterEach, describe, expect, it } from "vitest";
-import { WebSocket, WebSocketServer } from "ws";
-import { runAllowCommand } from "./allow.js";
-import { runDenyCommand } from "./deny.js";
+import type {
+  AgentPermissionRequest,
+  AgentPermissionResponse,
+} from "@getpaseo/protocol/agent-types";
+import { describe, expect, it } from "vitest";
+import { createAllowCommand, type PermitClient } from "./allow.js";
+import { createDenyCommand } from "./deny.js";
 
 const agentId = "2d85f428-fdaf-4d98-906f-c583de2b805f";
 const requests: AgentPermissionRequest[] = [
   { id: "permission-write", provider: "codex", name: "CodexBash", kind: "tool" },
   { id: "permission-edit", provider: "codex", name: "CodexBash", kind: "tool" },
 ];
-const cleanups: Array<() => Promise<void>> = [];
-afterEach(async () => {
-  for (const cleanup of cleanups.splice(0)) await cleanup();
-});
 
-/** Protocol peer that holds permission replies until the test resolves them. */
-async function createDaemonPeer() {
-  const home = await mkdtemp(join(tmpdir(), "paseo-permit-response-"));
-  const previousHome = process.env.PASEO_HOME;
-  process.env.PASEO_HOME = home;
-  const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
-  await once(server, "listening");
-  cleanups.push(async () => {
-    for (const socket of server.clients) socket.terminate();
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(home, { recursive: true, force: true });
-    if (previousHome === undefined) delete process.env.PASEO_HOME;
-    else process.env.PASEO_HOME = previousHome;
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("Missing peer port");
-  const responses = new Map<string, { socket: WebSocket; respond: () => void }>();
-  const received = new Set<string>();
-  const pending = [...requests];
-  let notifyReceived = () => {};
-  let closed = false;
+class PermissionClient implements PermitClient {
+  readonly pending = [...requests];
+  readonly responses = new Map<string, AgentPermissionResponse>();
+  closed = false;
+  private notifyReceived = () => {};
+  private readonly confirmations = new Map<
+    string,
+    {
+      resolve: () => void;
+      reject: (error: Error) => void;
+    }
+  >();
 
-  function emit(socket: WebSocket, message: unknown) {
-    socket.send(JSON.stringify({ type: "session", message }));
+  async fetchAgent() {
+    return { agent: { id: agentId, pendingPermissions: this.pending } };
   }
-  function receive(socket: WebSocket, raw: string) {
-    const frame = JSON.parse(raw);
-    if (frame.type === "ping") {
-      socket.send(JSON.stringify({ type: "pong" }));
-      return;
-    }
-    if (frame.type === "hello") {
-      emit(socket, {
-        type: "status",
-        payload: {
-          status: "server_info",
-          serverId: "srv_permit_test",
-          hostname: null,
-          version: null,
-          features: { ownedSubscriptions: true },
-        },
-      });
-      return;
-    }
-    if (frame.type !== "session") return;
-    const message = SessionInboundMessageSchema.parse(frame.message);
-    if (message.type === "fetch_agent_request") {
-      emit(socket, {
-        type: "fetch_agent_response",
-        payload: {
-          requestId: message.requestId,
-          error: null,
-          agent: {
-            id: agentId,
-            provider: "codex",
-            cwd: "/tmp/project",
-            model: null,
-            createdAt: "2026-10-01T00:00:00.000Z",
-            updatedAt: "2026-10-01T00:00:00.000Z",
-            lastUserMessageAt: null,
-            status: "running",
-            capabilities: {
-              supportsStreaming: true,
-              supportsSessionPersistence: false,
-              supportsDynamicModes: false,
-              supportsMcpServers: false,
-              supportsReasoningStream: false,
-              supportsToolInvocations: true,
-            },
-            currentModeId: null,
-            availableModes: [],
-            pendingPermissions: pending,
-            persistence: null,
-            title: null,
-          },
-        },
-      });
-    }
-    if (message.type === "agent_permission_response") {
-      responses.set(message.requestId, {
-        socket,
-        respond: () => {
-          pending.splice(
-            pending.findIndex((request) => request.id === message.requestId),
-            1,
-          );
-          emit(socket, {
-            type: "agent_permission_resolved",
-            payload: {
-              agentId: message.agentId,
-              requestId: message.requestId,
-              resolution: message.response,
-            },
-          });
-        },
-      });
-      received.add(message.requestId);
-      notifyReceived();
-    }
+
+  async respondToPermission(
+    _agentId: string,
+    requestId: string,
+    response: AgentPermissionResponse,
+  ) {
+    this.responses.set(requestId, response);
+    this.notifyReceived();
   }
-  server.on("connection", (socket) => {
-    socket.on("message", (raw) => receive(socket, raw.toString()));
-    socket.on("close", () => {
-      closed = true;
+
+  async respondToPermissionAndWait(
+    responseAgentId: string,
+    requestId: string,
+    response: AgentPermissionResponse,
+  ): Promise<void> {
+    const confirmation = new Promise<void>((resolve, reject) => {
+      this.confirmations.set(requestId, { resolve, reject });
     });
-  });
-  async function waitForResponses(count: number) {
-    while (received.size < count) {
+    await this.respondToPermission(responseAgentId, requestId, response);
+    await confirmation;
+  }
+
+  async close() {
+    this.closed = true;
+  }
+
+  async waitForResponses(count: number) {
+    while (this.responses.size < count) {
       await new Promise<void>((resolve) => {
-        notifyReceived = resolve;
+        this.notifyReceived = resolve;
       });
     }
   }
-  function resolvePermission(requestId: string) {
-    const response = responses.get(requestId);
-    if (!response) throw new Error(`Response not received: ${requestId}`);
-    response.respond();
+
+  confirm(requestId: string) {
+    const confirmation = this.confirmations.get(requestId);
+    if (!confirmation) throw new Error(`No confirmation waiter: ${requestId}`);
+    this.pending.splice(
+      this.pending.findIndex((request) => request.id === requestId),
+      1,
+    );
+    confirmation.resolve();
   }
-  async function resolveAndWaitForClient(requestId: string) {
-    const response = responses.get(requestId);
-    if (!response) throw new Error(`Response not received: ${requestId}`);
-    const { socket } = response;
-    // A pong after this reply proves the client consumed the preceding frame.
-    // Early completion closes the socket instead, which the caller also checks.
-    const processed = new Promise<void>((resolve) => {
-      const finish = () => {
-        socket.off("pong", finish);
-        socket.off("close", finish);
-        resolve();
-      };
-      socket.once("pong", finish);
-      socket.once("close", finish);
-    });
-    response.respond();
-    socket.ping();
-    await processed;
+
+  fail(requestId: string, error: Error) {
+    const confirmation = this.confirmations.get(requestId);
+    if (!confirmation) throw new Error(`No confirmation waiter: ${requestId}`);
+    confirmation.reject(error);
   }
-  return {
-    options: { daemonTarget: { kind: "endpoint" as const, host: `127.0.0.1:${address.port}` } },
-    pending,
-    waitForResponses,
-    resolve: resolvePermission,
-    resolveAndWaitForClient,
-    isClosed: () => closed,
-  };
 }
 
+const options = { daemonTarget: { kind: "endpoint" as const, host: "test.invalid" } };
 const actions = [
-  { name: "allow", run: runAllowCommand, result: "allowed" },
-  { name: "deny", run: runDenyCommand, result: "denied" },
+  { name: "allow", create: createAllowCommand, result: "allowed" },
+  { name: "deny", create: createDenyCommand, result: "denied" },
 ];
 for (const action of actions) {
   describe(`permit ${action.name}`, () => {
-    it("keeps the connection open and returns success only after resolution", async () => {
-      const peer = await createDaemonPeer();
+    it("returns success and closes only after confirmation", async () => {
+      const client = new PermissionClient();
       let completed = false;
-      const command = action.run(agentId, requests[0].id, peer.options, new Command());
+      const command = action.create(async () => client)(
+        agentId,
+        requests[0].id,
+        options,
+        new Command(),
+      );
       void command.then(
         () => (completed = true),
         () => false,
       );
-      await peer.waitForResponses(1);
+      await client.waitForResponses(1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(completed).toBe(false);
-      expect(peer.isClosed()).toBe(false);
-      expect(peer.pending).toEqual(requests);
-      peer.resolve(requests[0].id);
+      expect(client.closed).toBe(false);
+      expect(client.pending).toEqual(requests);
+      client.confirm(requests[0].id);
       const result = await command;
       expect(result.data).toEqual([
         {
@@ -196,34 +116,54 @@ for (const action of actions) {
           result: action.result,
         },
       ]);
-      expect(peer.pending).toEqual([requests[1]]);
+      expect(client.closed).toBe(true);
+      expect(client.pending).toEqual([requests[1]]);
     });
-    it("waits for every resolution with --all", async () => {
-      const peer = await createDaemonPeer();
+
+    it("waits for every confirmation with --all", async () => {
+      const client = new PermissionClient();
       let completed = false;
-      const command = action.run(agentId, undefined, { ...peer.options, all: true }, new Command());
+      const command = action.create(async () => client)(
+        agentId,
+        undefined,
+        { ...options, all: true },
+        new Command(),
+      );
       void command.then(
         () => (completed = true),
         () => false,
       );
-      await peer.waitForResponses(2);
-      await peer.resolveAndWaitForClient(requests[0].id);
+      await client.waitForResponses(2);
+      client.confirm(requests[0].id);
+      // Wait beyond the first reply's promise continuations while withholding the second.
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(completed).toBe(false);
-      expect(peer.isClosed()).toBe(false);
-      peer.resolve(requests[1].id);
+      expect(client.closed).toBe(false);
+      client.confirm(requests[1].id);
       const result = await command;
       expect(result.data.map((item) => item.result)).toEqual([action.result, action.result]);
-      expect(peer.pending).toEqual([]);
+      expect(client.closed).toBe(true);
+      expect(client.pending).toEqual([]);
     });
+
     it("rejects an unconfirmed response without returning success", async () => {
-      const peer = await createDaemonPeer();
-      const command = action.run(agentId, requests[0].id, peer.options, new Command());
-      await expect(command).rejects.toMatchObject({
+      const client = new PermissionClient();
+      const command = action.create(async () => client)(
+        agentId,
+        requests[0].id,
+        options,
+        new Command(),
+      );
+      const failure = expect(command).rejects.toMatchObject({
         code: "PERMISSION_RESPONSE_UNCONFIRMED",
         message: expect.stringContaining(requests[0].id),
         details: 'Use "paseo permit ls" to check whether the request is still pending',
       });
-      expect(peer.pending).toEqual(requests);
-    }, 20_000);
+      await client.waitForResponses(1);
+      client.fail(requests[0].id, new Error("Timeout waiting for message (15000ms)"));
+      await failure;
+      expect(client.closed).toBe(true);
+      expect(client.pending).toEqual(requests);
+    });
   });
 }
