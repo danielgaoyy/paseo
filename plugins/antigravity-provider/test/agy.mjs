@@ -7,7 +7,31 @@ const log = process.env.AGY_TEST_LOG;
 function record(value) {
   if (log) appendFileSync(log, `${JSON.stringify(value)}\n`);
 }
-record({ args, pid: process.pid, env: process.env.AGY_SESSION_VALUE });
+
+async function delaySetMode() {
+  const delay = Number(process.env.AGY_TEST_SET_MODE_DELAY_MS || "0");
+  if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+}
+const credentialPath = path.join(
+  process.env.ANTIGRAVITY_EXECUTABLE_DATA_DIR || "",
+  "antigravity-oauth-token",
+);
+let credentialSnapshot;
+try {
+  credentialSnapshot = readFileSync(credentialPath, "utf8");
+} catch {}
+record({
+  args,
+  pid: process.pid,
+  env: process.env.AGY_SESSION_VALUE,
+  ...(credentialSnapshot ? { credentialEmail: JSON.parse(credentialSnapshot).id_token_email } : {}),
+});
+if (args.includes("acp") && process.env.AGY_TEST_REFRESH_DELAY_MS) {
+  setTimeout(() => {
+    writeFileSync(credentialPath, credentialSnapshot);
+    record({ credentialRefresh: true });
+  }, Number(process.env.AGY_TEST_REFRESH_DELAY_MS));
+}
 
 function fixture(name, stream = "stdout") {
   return readFileSync(new URL(`./fixtures/${name}.${stream}.ndjson`, import.meta.url), "utf8")
@@ -275,8 +299,9 @@ function upsertConversationStepDb(convId, idx, status, stepType = 132) {
   const convDir = path.join(dataDir, "conversations");
   mkdirSync(convDir, { recursive: true });
   const dbPath = path.join(convDir, `${convId}.db`);
-  const db = new sqlite.DatabaseSync(dbPath);
+  const db = new sqlite.DatabaseSync(dbPath, { timeout: 5000 });
   try {
+    db.exec("PRAGMA journal_mode = WAL");
     db.exec(
       "CREATE TABLE IF NOT EXISTS steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER)",
     );
@@ -329,6 +354,7 @@ const PROMPT_ROUTES = [
   ["BG_WAKEUP_SLOW_TOOLS_DEFAULT", (id) => handleBgWakeupSlowToolsDefault(id)],
   ["TOOLS", (id) => handleToolsPrompt(id)],
   ["EDIT_AND_SHELL", (id) => handleEditAndShellPrompt(id)],
+  ["ASK_MULTI_ONEOF_QUESTION", (id) => handleAskMultiOneOfQuestionPrompt(id)],
   ["ASK_QUESTION", (id) => handleAskQuestionPrompt(id)],
   ["PROMPT_CACHED_USAGE", (id) => handlePromptCachedUsage(id)],
   ["USAGE_SIZE_OVERRIDE", (id) => handleUsageSizeOverride(id)],
@@ -583,6 +609,131 @@ async function handleAskQuestionPrompt(id) {
     content: {
       type: "text",
       text: `QUESTION_RESULT:${JSON.stringify(answer)}\n`,
+    },
+  });
+  respond(id, { stopReason: "end_turn" });
+}
+
+function decodeRealAgyQuestionAnswer(content, key, options, multi) {
+  const other = typeof content?.[`${key}_other`] === "string" ? content[`${key}_other`].trim() : "";
+  const chosen = [];
+  if (multi) {
+    const arr = Array.isArray(content?.[key]) ? content[key] : [];
+    for (const id of arr) {
+      const hit = options.find((o) => o.const === id);
+      if (hit) chosen.push(hit.title);
+    }
+  } else if (typeof content?.[key] === "string") {
+    const hit = options.find((o) => o.const === content[key]);
+    if (hit) chosen.push(hit.title);
+  }
+  if (other) chosen.push(other);
+  return chosen.length > 0 ? chosen.join(", ") : "User Skipped";
+}
+
+async function handleAskMultiOneOfQuestionPrompt(id) {
+  const toolCallId = "call-ask-multi-1";
+  const rawInput = {
+    questions: [
+      {
+        is_multi_select: false,
+        question: "Who approves PROD?",
+        options: ["Owner or SRE", "Owner only"],
+      },
+      {
+        is_multi_select: false,
+        question: "Initial rollout scope?",
+        options: ["Core repos", "All repos"],
+      },
+      {
+        is_multi_select: false,
+        question: "Any custom rollout note?",
+        options: [],
+      },
+      {
+        is_multi_select: true,
+        question: "Target regions?",
+        options: ["US, EU, and APAC", "LATAM"],
+      },
+    ],
+  };
+  notifyUpdate({
+    sessionUpdate: "tool_call",
+    toolCallId,
+    title: "Run ask_question",
+    kind: "other",
+    status: "pending",
+    rawInput,
+  });
+  const q1Opts = [
+    { const: "1", title: "Owner or SRE" },
+    { const: "2", title: "Owner only" },
+  ];
+  const q2Opts = [
+    { const: "1", title: "Core repos" },
+    { const: "2", title: "All repos" },
+  ];
+  const q4Opts = [
+    { const: "1", title: "US, EU, and APAC" },
+    { const: "2", title: "LATAM" },
+  ];
+  const answer = await requestClient("elicitation/create", {
+    sessionId,
+    toolCallId,
+    mode: "form",
+    message: "The agent has 4 questions.",
+    requestedSchema: {
+      type: "object",
+      properties: {
+        q1: { type: "string", title: "Who approves PROD?", oneOf: q1Opts },
+        q1_other: {
+          type: "string",
+          title: "Other",
+          description: "Optional free-form answer to: Who approves PROD?",
+        },
+        q2: { type: "string", title: "Initial rollout scope?", oneOf: q2Opts },
+        q2_other: {
+          type: "string",
+          title: "Other",
+          description: "Optional free-form answer to: Initial rollout scope?",
+        },
+        q3_other: {
+          type: "string",
+          title: "Other",
+          description: "Optional free-form answer to: Any custom rollout note?",
+        },
+        q3: { type: "string", title: "Any custom rollout note?" },
+        q4: { type: "array", title: "Target regions?", items: { anyOf: q4Opts } },
+        q4_other: {
+          type: "string",
+          title: "Other",
+          description: "Optional free-form answer to: Target regions?",
+        },
+      },
+    },
+  });
+  notifyUpdate({
+    sessionUpdate: "tool_call_update",
+    toolCallId,
+    title: "Run ask_question",
+    kind: "other",
+    status: "completed",
+    rawInput,
+  });
+  const summary =
+    answer?.action === "accept"
+      ? [
+          `A1: ${decodeRealAgyQuestionAnswer(answer.content, "q1", q1Opts, false)}`,
+          `A2: ${decodeRealAgyQuestionAnswer(answer.content, "q2", q2Opts, false)}`,
+          `A3: ${decodeRealAgyQuestionAnswer(answer.content, "q3", [], false)}`,
+          `A4: ${decodeRealAgyQuestionAnswer(answer.content, "q4", q4Opts, true)}`,
+        ].join("\n")
+      : "CANCELED";
+  notifyUpdate({
+    sessionUpdate: "agent_message_chunk",
+    content: {
+      type: "text",
+      text: `${summary}\nWIRE:${JSON.stringify(answer)}\n`,
     },
   });
   respond(id, { stopReason: "end_turn" });
@@ -2183,6 +2334,7 @@ lines.on("line", async (line) => {
   }
 
   if (method === "session/set_mode") {
+    await delaySetMode();
     if (process.env.AGY_TEST_SET_MODE === "unsupported") {
       send({
         jsonrpc: "2.0",
